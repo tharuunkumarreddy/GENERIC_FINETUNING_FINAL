@@ -1,0 +1,333 @@
+name: Generic Dataset Preparation
+description: Prepares datasets for LoRA fine-tuning (SLM/LLM/VLM) from either Hugging Face repositories or PI API structured JSON. Automatically formats data into chat-style messages and saves schema metadata for downstream fine-tuning.
+
+inputs:
+  - {name: dataset_source, type: String, description: 'Either hf or pi'}
+  - {name: dataset_uri, type: String, description: 'For HF dataset name or path. For PI API URL endpoint'}
+  - {name: input_field, type: String, description: 'Column or key used for user prompt'}
+  - {name: output_field, type: String, description: 'Column or key used for response'}  
+  - {name: image_field, type: String, description: 'Optional column for image for multimodal data'}
+  - {name: validation_split, type: Float, description: 'Validation split ratio'}
+  - {name: max_records, type: Integer, description: 'Limit for quick local tests'}
+  - {name: hf_token, type: String, description: 'Hugging Face access token for private datasets'}  
+  - {name: access_token, type: string, description: 'Bearer access token for API auth'}     
+
+outputs:
+  - {name: processed_dataset, type: Data}
+  - {name: schema_json, type: Data}   
+
+implementation:
+  container:
+    image: nikhilv215/nesy-factory:v22
+    command:
+      - sh
+      - -c
+      - |
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import json
+        import pandas as pd
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        from datasets import load_dataset, Dataset, DatasetDict
+        import logging
+        
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger('dataset_prep')
+        
+        def ensure_directory_exists(file_path):
+            directory = os.path.dirname(file_path)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+        
+        def get_token_value(token_arg):
+            if not token_arg:
+                logger.info("Token argument is None or empty")
+                return None
+            token_str = str(token_arg).strip()
+            logger.info(f"Token argument received: {token_str[:50]}..." if len(token_str) > 50 else f"Token argument received: {token_str}")
+            if os.path.exists(token_str):
+                logger.info(f"Reading token from file: {token_str}")
+                try:
+                    with open(token_str, 'r') as f:
+                        content = f.read().strip()
+                        logger.info(f"Token file content length: {len(content)}")
+                        return content if content else None
+                except Exception as e:
+                    logger.error(f"Failed to read token file: {e}")
+                    return None
+            else:
+                logger.info("Token is direct string value (not a file path)")
+                return token_str if token_str and token_str != "None" else None
+        
+        parser = argparse.ArgumentParser(description="Generic dataset preparation")
+        parser.add_argument("--dataset_source", required=True)
+        parser.add_argument("--dataset_uri", required=True)
+        parser.add_argument("--input_field", required=True)
+        parser.add_argument("--output_field", required=True)
+        parser.add_argument("--image_field", default="")
+        parser.add_argument("--validation_split", type=float, default=0.02)
+        parser.add_argument("--max_records", type=int, default=2000)
+        parser.add_argument("--hf_token", default=None)
+        parser.add_argument("--access_token", default=None)
+        parser.add_argument("--processed_dataset", required=True)
+        parser.add_argument("--schema_json", required=True)
+        args = parser.parse_args()
+        
+        hf_token = get_token_value(args.hf_token)
+        access_token = get_token_value(args.access_token)
+        
+        logger.info(f"Raw args.hf_token: {args.hf_token}")
+        logger.info(f"Raw args.access_token: {args.access_token}")
+        logger.info(f"HF Token present: {bool(hf_token)}")
+        logger.info(f"Access Token present: {bool(access_token)}")
+        logger.info(f"Access Token length: {len(access_token) if access_token else 0}")
+        
+        def build_messages(example, input_col, output_col, image_col=None):
+            user_msg = str(example.get(input_col, "")).strip()
+            raw_output = example.get(output_col, "")
+            if isinstance(raw_output, (dict, list)):
+                assistant_msg = json.dumps(raw_output, ensure_ascii=False)
+            else:
+                assistant_msg = str(raw_output).strip()
+            messages = []
+            if image_col and image_col in example and example[image_col]:
+                messages.append({"role": "user", "content": f"[IMAGE]: {example[image_col]}"})
+            if user_msg:
+                messages.append({"role": "user", "content": user_msg})
+            if assistant_msg:
+                messages.append({"role": "assistant", "content": assistant_msg})
+            return messages
+        
+        def load_hf_dataset(uri, token=None):
+            logger.info(f"Loading Hugging Face dataset: {uri}")
+            if token and token.strip() and not token.startswith("$"):
+                try:
+                    logger.info("Attempting to load with authentication token")
+                    return load_dataset(uri, token=token)
+                except Exception as e:
+                    logger.warning(f"Failed with token, retrying without authentication: {e}")
+            try:
+                logger.info("Loading dataset without authentication")
+                return load_dataset(uri)
+            except Exception as e:
+                logger.error(f"Failed to load dataset: {e}")
+                raise e
+        
+        def load_pi_api_dataset(api_url, access_token, input_field, output_field):
+            logger.info(f"Fetching PI API dataset from {api_url}")
+            session = requests.Session()
+            retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+            session.mount("http://", HTTPAdapter(max_retries=retries))
+            session.mount("https://", HTTPAdapter(max_retries=retries))
+            payload = {
+                "dbType": "TIDB",
+                "entityId": "",
+                "entityIds": [],
+                "ownedOnly": False,
+                "projections": [],
+                "filter": {},
+                "startTime": 0,
+                "endTime": 0
+            }
+            headers = {"Authorization": f"Bearer {access_token}"} if access_token else {}
+            try:
+                resp = session.post(api_url, headers=headers, json=payload, timeout=60)
+                resp.raise_for_status()
+                raw_data = resp.json()
+            except Exception as e:
+                logger.error(f'API failed: {str(e)}')
+                raise
+            
+            logger.info(f"Raw API response type: {type(raw_data)}")
+            if isinstance(raw_data, list) and raw_data:
+                logger.info(f"First item keys: {list(raw_data[0].keys()) if isinstance(raw_data[0], dict) else 'Not a dict'}")
+            elif isinstance(raw_data, dict):
+                logger.info(f"Response keys: {list(raw_data.keys())}")
+            
+            if isinstance(raw_data, dict):
+                for wrapper_key in ['content', 'data', 'results', 'items', 'records']:
+                    if wrapper_key in raw_data and isinstance(raw_data[wrapper_key], list):
+                        logger.info(f"Unwrapping data from '{wrapper_key}' key")
+                        raw_data = raw_data[wrapper_key]
+                        break
+            
+            if isinstance(raw_data, list) and raw_data and all(isinstance(x, dict) for x in raw_data):
+                if input_field in raw_data[0]:
+                    logger.info(f"Flat PI API schema detected. Found '{input_field}' field in data.")
+                    records = []
+                    for item in raw_data:
+                        prompt = item.get(input_field, "")
+                        response = item.get(output_field, "")
+                        if isinstance(response, (dict, list)):
+                            response = json.dumps(response, ensure_ascii=False)
+                        if prompt or response:
+                            records.append({"instruction": prompt, "output": response})
+                    logger.info(f"Extracted {len(records)} records from flat schema")
+                    return DatasetDict({"train": Dataset.from_list(records)})
+            
+            logger.info("Nested PI API schema detected - attempting recursive extraction")
+            
+            CHILD_KEYS = ["subsections", "sections", "children", "items", "data", "results", "individualResults"]
+            TITLE_KEYS = ["title", "heading", "name", input_field]
+            CONTENT_KEYS = ["content", "text", "body", output_field]
+            
+            def iter_children(node):
+                # Get child nodes from various possible keys
+                if not isinstance(node, dict):
+                    return []
+                for k in CHILD_KEYS:
+                    v = node.get(k)
+                    if isinstance(v, list):
+                        return v
+                for v in node.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        return v
+                return []
+            
+            def get_first(node, keys):
+                # Get first non-empty value from specified keys
+                if not isinstance(node, dict):
+                    return ""
+                for k in keys:
+                    val = node.get(k)
+                    if val:
+                        return str(val).strip()
+                return ""
+            
+            def extract_recursive(node, path="", depth=0):
+                # Recursively extract title/content pairs
+                if depth > 20:
+                    return []
+                
+                results = []
+                
+                if isinstance(node, dict):
+                    title = get_first(node, TITLE_KEYS)
+                    content = get_first(node, CONTENT_KEYS)
+                    
+                    if title or content:
+                        results.append({"title": title, "content": content, "path": path})
+                    
+                    for idx, child in enumerate(iter_children(node)):
+                        subpath = f"{path}/sub_{idx}" if path else f"sub_{idx}"
+                        results.extend(extract_recursive(child, subpath, depth + 1))
+                
+                elif isinstance(node, list):
+                    for idx, item in enumerate(node):
+                        subpath = f"{path}/item_{idx}" if path else f"item_{idx}"
+                        results.extend(extract_recursive(item, subpath, depth + 1))
+                
+                return results
+            
+            def extract_all(raw):
+                # Extract all records from nested structure
+                all_rows = []
+                items = raw if isinstance(raw, list) else [raw]
+                
+                for idx, item in enumerate(items):
+                    logger.info(f"Processing item {idx}, type: {type(item)}")
+                    all_rows.extend(extract_recursive(item, f"root_{idx}"))
+                
+                return all_rows
+            
+            flat_items = extract_all(raw_data)
+            logger.info(f"Extracted {len(flat_items)} flat items from nested structure")
+            
+            if flat_items:
+                logger.info(f"Sample extracted item keys: {list(flat_items[0].keys())}")
+                logger.info(f"Sample extracted item: {json.dumps(flat_items[0], indent=2)[:200]}")
+            
+            records = []
+            for item in flat_items:
+                prompt = item.get(input_field, "") or item.get("title", "")
+                response = item.get(output_field, "") or item.get("content", "")
+                
+                if prompt or response:
+                    records.append({"instruction": str(prompt).strip(), "output": str(response).strip()})
+            
+            if not records:
+                logger.error(f"No records extracted. Flat items count: {len(flat_items)}")
+                if flat_items:
+                    logger.error(f"Sample flat item: {json.dumps(flat_items[0], indent=2)}")
+                logger.error(f"Looking for input_field='{input_field}' and output_field='{output_field}'")
+                logger.error(f"Sample raw data (first 1000 chars): {json.dumps(raw_data if not isinstance(raw_data, list) or len(str(raw_data)) < 1000 else raw_data[:2], indent=2)[:1000]}")
+                raise ValueError(f"No records extracted from PI API response. Check that input_field='{input_field}' and output_field='{output_field}' match your API response structure.")
+            
+            logger.info(f"Successfully extracted {len(records)} records")
+            return DatasetDict({"train": Dataset.from_list(records)})
+        
+        ensure_directory_exists(args.processed_dataset)
+        ensure_directory_exists(args.schema_json)
+        
+        if args.dataset_source.lower() == "huggingface":
+            dataset = load_hf_dataset(args.dataset_uri, hf_token)
+        elif args.dataset_source.lower() == "pi_api":
+            if not access_token:
+                raise ValueError("PI API mode requires access_token. Please provide a valid access token.")
+            dataset = load_pi_api_dataset(args.dataset_uri, access_token, args.input_field, args.output_field)
+        else:
+            raise ValueError(f"Unsupported dataset_source: {args.dataset_source}")
+        
+        train = dataset["train"]
+        if args.max_records and len(train) > args.max_records:
+            train = train.select(range(args.max_records))
+        if "validation" in dataset:
+            ds_dict = dataset
+        else:
+            split = train.train_test_split(test_size=args.validation_split, seed=42)
+            ds_dict = DatasetDict({"train": split["train"], "validation": split["test"]})
+        
+        def add_messages(example):
+            return {"messages": build_messages(example, args.input_field, args.output_field, args.image_field)}
+        
+        ds_dict = ds_dict.map(add_messages)
+        ds_dict.save_to_disk(args.processed_dataset)
+        
+        schema = {
+            "dataset_source": args.dataset_source,
+            "dataset_uri": args.dataset_uri,
+            "input_field": args.input_field,
+            "output_field": args.output_field,
+            "image_field": args.image_field or None,
+            "num_train": len(ds_dict["train"]),
+            "num_val": len(ds_dict["validation"]),
+            "source_type": args.dataset_source.lower()
+        }
+        
+        with open(args.schema_json, "w") as f:
+            json.dump(schema, f, indent=2)
+        
+        logger.info("Dataset preparation complete")
+        logger.info(json.dumps(schema, indent=2))
+    args:
+      - --dataset_source
+      - {inputValue: dataset_source}
+      - --dataset_uri
+      - {inputValue: dataset_uri}
+      - --input_field
+      - {inputValue: input_field}
+      - --output_field
+      - {inputValue: output_field}
+      - --image_field
+      - {inputValue: image_field}
+      - --validation_split
+      - {inputValue: validation_split}
+      - --max_records
+      - {inputValue: max_records}
+      - --hf_token
+      - {inputValue: hf_token}
+      - --access_token
+      - {inputValue: access_token}
+      - --processed_dataset
+      - {outputPath: processed_dataset}
+      - --schema_json
+      - {outputPath: schema_json}
+
+
