@@ -1,0 +1,313 @@
+name: LoRA Adapter Archive CDN Uploader
+description: Compresses the LoRA adapter directory (adapter/, tokenizer files, run_config.json) from Generic LoRA Fine-tuning and uploads the archive to CDN. Returns the public CDN URL and decompression instructions.
+
+inputs:
+  - name: adapter_directory
+    type: Model
+    description: 'Output directory from Generic LoRA Fine-tuning component containing adapter/, tokenizer files, run_config.json, etc.'
+  - name: bearer_token
+    type: string
+    description: 'Bearer token for CDN authentication'
+  - name: compression_format
+    type: string
+    description: 'Compression format: tar.gz, zip, or tar'
+    default: 'tar.gz'
+
+outputs:
+  - name: archive_cdn_url
+    type: string
+    description: 'CDN URL where the compressed LoRA adapter archive is accessible'
+  - name: archive_metadata
+    type: Data
+    description: 'JSON file containing archive info, decompression instructions, and adapter metadata'
+
+implementation:
+  container:
+    image: python:3.9-slim
+    command:
+      - sh
+      - -c
+      - |
+        apt-get update && apt-get install -y curl
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import subprocess
+        import json
+        import os
+        import tarfile
+        import zipfile
+        import shutil
+        from datetime import datetime
+
+        parser = argparse.ArgumentParser(description='Compress LoRA adapter directory and upload to CDN.')
+        parser.add_argument('--adapter_directory', type=str, required=True)
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--compression_format', type=str, default='tar.gz', choices=['tar.gz', 'tar', 'zip'])
+        parser.add_argument('--archive_cdn_url', type=str, required=True)
+        parser.add_argument('--archive_metadata', type=str, required=True)
+        args = parser.parse_args()
+
+        bearer_token = args.bearer_token
+        upload_url = 'https://igs.gov-cloud.ai/mobius-content-service/v1.0/content/upload?filePath=MPQE1&contentTags=lora_adapter'
+
+        def verify_adapter_structure(adapter_dir):
+            if not os.path.isdir(adapter_dir):
+                raise NotADirectoryError('Adapter directory not found: ' + adapter_dir)
+            
+            found_items = os.listdir(adapter_dir)
+            print('Found items in adapter directory: ' + str(found_items))
+            
+            has_adapter = 'adapter' in found_items and os.path.isdir(os.path.join(adapter_dir, 'adapter'))
+            if not has_adapter:
+                raise ValueError('Missing required adapter/ subdirectory. Found: ' + str(found_items))
+            
+            adapter_path = os.path.join(adapter_dir, 'adapter')
+            adapter_files = os.listdir(adapter_path)
+            required_adapter_files = ['adapter_config.json', 'adapter_model.safetensors']
+            
+            missing_files = [f for f in required_adapter_files if f not in adapter_files]
+            if missing_files:
+                print('WARNING: Missing expected adapter files: ' + str(missing_files))
+            
+            has_merged = 'merged_model' in found_items and os.path.isdir(os.path.join(adapter_dir, 'merged_model'))
+            
+            tokenizer_files = [f for f in found_items if 'tokenizer' in f.lower() or f in ['vocab.json', 'special_tokens_map.json']]
+            checkpoint_dirs = [f for f in found_items if f.startswith('checkpoint-') and os.path.isdir(os.path.join(adapter_dir, f))]
+            
+            print('Adapter structure verified:')
+            print('  - adapter/ subdirectory: YES')
+            print('  - Adapter files: ' + str(adapter_files))
+            print('  - Tokenizer files: ' + str(tokenizer_files))
+            print('  - Checkpoint directories: ' + str(checkpoint_dirs if checkpoint_dirs else 'None'))
+            print('  - merged_model/ directory: ' + ('YES' if has_merged else 'NO'))
+            
+            run_config = {}
+            run_config_path = os.path.join(adapter_dir, 'run_config.json')
+            if os.path.exists(run_config_path):
+                with open(run_config_path, 'r') as f:
+                    run_config = json.load(f)
+                print('  - run_config.json: FOUND')
+            else:
+                print('  - run_config.json: NOT FOUND')
+            
+            structure_info = {
+                'root_contents': found_items,
+                'adapter_files': adapter_files,
+                'tokenizer_files': tokenizer_files,
+                'checkpoint_dirs': checkpoint_dirs,
+                'has_merged_model': has_merged,
+                'run_config': run_config
+            }
+            
+            return structure_info
+
+        def get_directory_size(path):
+            total = 0
+            for dirpath, dirnames, filenames in os.walk(path):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.exists(filepath):
+                        total += os.path.getsize(filepath)
+            return total
+
+        def compress_directory(adapter_dir, output_archive, compression_format):
+            adapter_name = os.path.basename(adapter_dir.rstrip('/'))
+            print('Starting compression in ' + compression_format + ' format...')
+            
+            try:
+                if compression_format == 'tar.gz':
+                    with tarfile.open(output_archive, 'w:gz') as tar:
+                        tar.add(adapter_dir, arcname=adapter_name)
+                elif compression_format == 'tar':
+                    with tarfile.open(output_archive, 'w') as tar:
+                        tar.add(adapter_dir, arcname=adapter_name)
+                elif compression_format == 'zip':
+                    with zipfile.ZipFile(output_archive, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for root, dirs, files in os.walk(adapter_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.join(adapter_name, os.path.relpath(file_path, adapter_dir))
+                                zf.write(file_path, arcname)
+                
+                archive_size = os.path.getsize(output_archive)
+                size_mb = archive_size / 1024 / 1024
+                print('Compression successful! Archive size: ' + str(archive_size) + ' bytes (' + '{:.2f}'.format(size_mb) + ' MB)')
+                return archive_size
+            except Exception as e:
+                print('Compression failed: ' + str(e))
+                raise
+
+        def upload_file_to_cdn(file_path, output_url_path):
+            if not os.path.exists(file_path):
+                raise FileNotFoundError('File not found: ' + file_path)
+            
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                raise ValueError('Archive file is empty')
+            
+            size_mb = file_size / 1024 / 1024
+            print('Uploading archive: ' + file_path)
+            print('File size: ' + str(file_size) + ' bytes (' + '{:.2f}'.format(size_mb) + ' MB)')
+            
+            curl_command = [
+                'curl',
+                '--location', upload_url,
+                '--header', 'Authorization: Bearer ' + bearer_token,
+                '--form', 'file=@' + file_path,
+                '--fail',
+                '--show-error'
+            ]
+            
+            print('Executing upload...')
+            
+            try:
+                process = subprocess.run(curl_command, capture_output=True, check=True)
+                response_text = process.stdout.decode('utf-8')
+                print('Upload successful!')
+                
+                response_json = json.loads(response_text)
+                relative_cdn_url = response_json.get('cdnUrl')
+                
+                if not relative_cdn_url:
+                    raise ValueError('CDN response missing cdnUrl field')
+                
+                full_cdn_url = 'https://cdn-new.gov-cloud.ai' + relative_cdn_url
+                print('Archive available at: ' + full_cdn_url)
+                
+                output_dir = os.path.dirname(output_url_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                
+                with open(output_url_path, 'w') as f:
+                    f.write(full_cdn_url)
+                
+                print('CDN URL saved to: ' + output_url_path)
+                return full_cdn_url
+            except subprocess.CalledProcessError as e:
+                print('Upload failed!')
+                print('Exit code: ' + str(e.returncode))
+                print('Error output: ' + e.stderr.decode('utf-8'))
+                raise
+            except json.JSONDecodeError as e:
+                print('Failed to parse server response as JSON')
+                print('Response was: ' + process.stdout.decode('utf-8'))
+                raise
+
+        def save_metadata(metadata_path, metadata_dict):
+            output_dir = os.path.dirname(metadata_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata_dict, f, indent=2)
+            
+            print('Metadata saved to: ' + metadata_path)
+
+        try:
+            print('=' * 60)
+            print('LoRA Adapter Archive CDN Uploader')
+            print('=' * 60)
+            print('Verifying adapter structure...')
+            structure_info = verify_adapter_structure(args.adapter_directory)
+            
+            original_size = get_directory_size(args.adapter_directory)
+            size_mb = original_size / 1024 / 1024
+            print('Original adapter size: ' + str(original_size) + ' bytes (' + '{:.2f}'.format(size_mb) + ' MB)')
+            
+            timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            adapter_basename = os.path.basename(args.adapter_directory.rstrip('/'))
+            archive_name = 'lora_adapter_' + timestamp + '.' + args.compression_format
+            archive_path = os.path.join('/tmp', archive_name)
+            
+            archive_size = compress_directory(args.adapter_directory, archive_path, args.compression_format)
+            cdn_url = upload_file_to_cdn(archive_path, args.archive_cdn_url)
+            
+            compression_ratio = (1 - archive_size / original_size) * 100 if original_size > 0 else 0
+            
+            decompression_cmds = {
+                'tar.gz': 'tar -xzf ' + archive_name,
+                'tar': 'tar -xf ' + archive_name,
+                'zip': 'unzip ' + archive_name
+            }
+            
+            metadata = {
+                'upload_timestamp': datetime.utcnow().isoformat(),
+                'cdn_url': cdn_url,
+                'archive_name': archive_name,
+                'original_size_bytes': original_size,
+                'archive_size_bytes': archive_size,
+                'compression_ratio_percent': round(compression_ratio, 2),
+                'compression_format': args.compression_format,
+                'structure': {
+                    'root_contents': structure_info['root_contents'],
+                    'adapter_files': structure_info['adapter_files'],
+                    'tokenizer_files': structure_info['tokenizer_files'],
+                    'checkpoint_dirs': structure_info['checkpoint_dirs'],
+                    'has_merged_model': structure_info['has_merged_model']
+                },
+                'training_config': structure_info['run_config'],
+                'decompression_instructions': decompression_cmds[args.compression_format],
+                'usage_instructions': {
+                    'download': 'wget ' + cdn_url,
+                    'extract': decompression_cmds[args.compression_format],
+                    'load_in_merge_component': 'Use the extracted lora_out directory as adapter_dir input in Merge LoRA Adapter component',
+                    'load_adapter_only': 'from peft import PeftModel; model = PeftModel.from_pretrained(base_model, "lora_out/adapter")',
+                    'load_merged_model': 'from transformers import AutoModelForCausalLM; model = AutoModelForCausalLM.from_pretrained("lora_out/merged_model")' if structure_info['has_merged_model'] else 'N/A - No merged model found'
+                }
+            }
+            
+            save_metadata(args.archive_metadata, metadata)
+            
+            if os.path.exists(archive_path):
+                os.remove(archive_path)
+                print('Cleaned up temporary archive: ' + archive_path)
+            
+            print('')
+            print('=' * 60)
+            print('SUCCESS!')
+            print('Archive available at: ' + cdn_url)
+            print('Archive name: ' + archive_name)
+            print('Compression ratio: ' + '{:.1f}'.format(compression_ratio) + '%')
+            print('Decompression command: ' + metadata['decompression_instructions'])
+            print('=' * 60)
+            
+            run_config = structure_info['run_config']
+            if run_config:
+                print('')
+                print('Training Configuration:')
+                print('  Model: ' + str(run_config.get('model_name', 'N/A')))
+                print('  LoRA Rank: ' + str(run_config.get('lora_r', 'N/A')))
+                print('  LoRA Alpha: ' + str(run_config.get('lora_alpha', 'N/A')))
+                print('  Training Samples: ' + str(run_config.get('num_train_samples', 'N/A')))
+                print('  Epochs: ' + str(run_config.get('epochs', 'N/A')))
+                print('=' * 60)
+            
+            if structure_info['checkpoint_dirs']:
+                print('')
+                print('Note: Archive includes ' + str(len(structure_info['checkpoint_dirs'])) + ' checkpoint(s): ' + str(structure_info['checkpoint_dirs']))
+            
+            if structure_info['has_merged_model']:
+                print('Note: Archive includes merged_model directory')
+                print('=' * 60)
+                
+        except Exception as e:
+            print('')
+            print('UPLOAD FAILED!')
+            print('Error: ' + str(e))
+            raise
+
+    args:
+      - --adapter_directory
+      - {inputPath: adapter_directory}
+      - --bearer_token
+      - {inputValue: bearer_token}
+      - --compression_format
+      - {inputValue: compression_format}
+      - --archive_cdn_url
+      - {outputPath: archive_cdn_url}
+      - --archive_metadata
+      - {outputPath: archive_metadata}
