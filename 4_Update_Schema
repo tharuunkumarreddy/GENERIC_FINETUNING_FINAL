@@ -72,7 +72,7 @@ implementation:
                 return {}
 
         def get_repo_url_value(url_input):
-            """Get repository URL from file path - Kubeflow saves String outputs as files"""
+            #Get repository URL from file path - Kubeflow saves String outputs as files#
             if not url_input or url_input == '':
                 return ''
             
@@ -96,11 +96,11 @@ implementation:
                     return ''
 
         def extract_hf_id(repo_url, is_adapter=True):
-            """
-            Extract HuggingFace ID from repository URL
-            For adapters: Remove https://huggingface.co/ -> tharun2909/disligpt_FT_adapter
-            For GGUF models: Replace https://huggingface.co/ with hf.co/ -> hf.co/tharun2909/disligpt_FT_new
-            """
+            
+            #Extract HuggingFace ID from repository URL
+            #For adapters: Remove https://huggingface.co/ -> tharun2909/disligpt_FT_adapter
+            #For GGUF models: Replace https://huggingface.co/ with hf.co/ -> hf.co/tharun2909/disligpt_FT_new
+            
             if not repo_url or repo_url == '':
                 return ''
             
