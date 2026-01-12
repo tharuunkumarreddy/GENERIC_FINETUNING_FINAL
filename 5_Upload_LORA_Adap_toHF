@@ -1,0 +1,235 @@
+name: Upload LoRA Adapters to HuggingFace Hub
+description: Uploads LoRA adapter weights and tokenizer to HuggingFace Hub repository. Supports both creating new repositories and updating existing ones.
+
+inputs:
+  - {name: lora_adapters, type: Model, description: 'Path to LoRA adapters directory from Generic LoRA Fine-tuning component'}
+  - {name: repo_id, type: String, description: 'HuggingFace repository ID (e.g., username/model-name)'}
+  - {name: hf_token, type: String, description: 'HuggingFace access token with write permissions'}
+  - {name: private, type: String, description: 'Whether to make repository private (true/false)'}
+  - {name: commit_message, type: String, description: 'Commit message for the upload'}
+
+outputs:
+  - {name: repository_url, type: String}
+
+metadata:
+  annotations:
+    author: Upload LoRA Adapters Component
+
+implementation:
+  container:
+    image: python:3.10
+    command:
+      - sh
+      - -c
+      - (pip install --no-cache-dir huggingface_hub > /dev/null 2>&1) && "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        def _make_parent_dirs_and_return_path(file_path):
+            import os
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            return file_path
+        
+        def upload_lora_adapters(
+            lora_adapters_path,
+            repo_id,
+            hf_token,
+            private,
+            commit_message,
+            repository_url_path,
+        ):
+            import os
+            import json
+            import logging
+            from huggingface_hub import HfApi, login, create_repo
+            
+            logging.basicConfig(level=logging.INFO)
+            logger = logging.getLogger("lora_uploader")
+            
+            logger.info("=" * 70)
+            logger.info("Starting LoRA Adapters Upload to HuggingFace Hub")
+            logger.info("=" * 70)
+            logger.info(f"LoRA adapters directory: {lora_adapters_path}")
+            logger.info(f"Target repository: {repo_id}")
+            logger.info(f"Private repository: {private}")
+            
+            def get_token_value(token_arg):
+                if not token_arg:
+                    raise ValueError("HuggingFace token is required")
+                token_str = str(token_arg).strip()
+                if os.path.exists(token_str):
+                    try:
+                        with open(token_str) as f:
+                            content = f.read().strip()
+                            return content if content else None
+                    except Exception as e:
+                        logger.error(f"Failed to read token file: {e}")
+                        raise
+                else:
+                    return token_str if token_str and token_str != "None" else None
+            
+            token = get_token_value(hf_token)
+            if not token:
+                raise ValueError("Valid HuggingFace token is required")
+            
+            is_private = private.lower() in ['true', '1', 'yes']
+            
+            logger.info("Logging in to HuggingFace Hub...")
+            try:
+                login(token=token)
+                logger.info("Successfully logged in to HuggingFace Hub")
+            except Exception as e:
+                logger.error(f"Failed to login to HuggingFace: {e}")
+                raise
+            
+            api = HfApi()
+            
+            if not os.path.exists(lora_adapters_path):
+                raise FileNotFoundError(f"LoRA adapters directory not found: {lora_adapters_path}")
+            
+            adapter_subdir = os.path.join(lora_adapters_path, "adapter")
+            if not os.path.exists(adapter_subdir):
+                logger.error(f"Adapter subdirectory not found at: {adapter_subdir}")
+                logger.info(f"Contents of {lora_adapters_path}:")
+                if os.path.exists(lora_adapters_path):
+                    for item in os.listdir(lora_adapters_path):
+                        logger.info(f"  - {item}")
+                raise FileNotFoundError(f"Adapter subdirectory not found at: {adapter_subdir}")
+            
+            logger.info(f"Found adapter directory: {adapter_subdir}")
+            
+            logger.info(f"Creating/verifying repository: {repo_id}")
+            try:
+                create_repo(
+                    repo_id=repo_id,
+                    token=token,
+                    private=is_private,
+                    exist_ok=True,
+                    repo_type="model"
+                )
+                logger.info(f"Repository ready: {repo_id}")
+            except Exception as e:
+                logger.error(f"Failed to create/verify repository: {e}")
+                raise
+            
+            logger.info("=" * 70)
+            logger.info("Uploading LoRA adapter files...")
+            logger.info("=" * 70)
+            
+            uploaded_files = []
+            
+            adapter_files = os.listdir(adapter_subdir)
+            logger.info(f"Found {len(adapter_files)} files in adapter directory")
+            
+            for filename in adapter_files:
+                filepath = os.path.join(adapter_subdir, filename)
+                if os.path.isfile(filepath):
+                    try:
+                        file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                        logger.info(f"Uploading {filename} ({file_size_mb:.2f} MB)...")
+                        
+                        api.upload_file(
+                            path_or_fileobj=filepath,
+                            path_in_repo=filename,
+                            repo_id=repo_id,
+                            repo_type="model",
+                            token=token,
+                            commit_message=commit_message
+                        )
+                        
+                        logger.info(f"✓ Successfully uploaded: {filename}")
+                        uploaded_files.append(filename)
+                        
+                    except Exception as e:
+                        logger.error(f"✗ Failed to upload {filename}: {e}")
+                        raise
+            
+            logger.info("=" * 70)
+            logger.info("Uploading tokenizer files...")
+            logger.info("=" * 70)
+            
+            tokenizer_files = ['tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 
+                             'tokenizer.model', 'vocab.json', 'merges.txt', 'added_tokens.json']
+            
+            for filename in tokenizer_files:
+                filepath = os.path.join(lora_adapters_path, filename)
+                if os.path.exists(filepath):
+                    try:
+                        file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                        logger.info(f"Uploading {filename} ({file_size_mb:.2f} MB)...")
+                        
+                        api.upload_file(
+                            path_or_fileobj=filepath,
+                            path_in_repo=filename,
+                            repo_id=repo_id,
+                            repo_type="model",
+                            token=token,
+                            commit_message="Upload tokenizer files"
+                        )
+                        
+                        logger.info(f"✓ Successfully uploaded: {filename}")
+                        uploaded_files.append(filename)
+                        
+                    except Exception as e:
+                        logger.warning(f"Could not upload {filename} (may not exist): {e}")
+            
+            run_config_path = os.path.join(lora_adapters_path, "run_config.json")
+            if os.path.exists(run_config_path):
+                try:
+                    logger.info("Uploading run_config.json...")
+                    api.upload_file(
+                        path_or_fileobj=run_config_path,
+                        path_in_repo="run_config.json",
+                        repo_id=repo_id,
+                        repo_type="model",
+                        token=token,
+                        commit_message="Upload training configuration"
+                    )
+                    logger.info("✓ run_config.json uploaded successfully")
+                    uploaded_files.append("run_config.json")
+                except Exception as e:
+                    logger.warning(f"Failed to upload run_config.json (non-critical): {e}")
+            
+            repo_url = f"https://huggingface.co/{repo_id}"
+            
+            logger.info("=" * 70)
+            logger.info("Upload Complete!")
+            logger.info("=" * 70)
+            logger.info(f"Repository URL: {repo_url}")
+            logger.info(f"Total files uploaded: {len(uploaded_files)}")
+            logger.info(f"Private: {is_private}")
+            logger.info("=" * 70)
+            logger.info("Your LoRA adapters are now available on HuggingFace Hub!")
+            logger.info("=" * 70)
+            
+            os.makedirs(os.path.dirname(repository_url_path), exist_ok=True)
+            with open(repository_url_path, 'w') as f:
+                f.write(repo_url)
+            
+            logger.info(f"Repository URL saved to: {repository_url_path}")
+        
+        import argparse
+        _parser = argparse.ArgumentParser(prog="Upload LoRA Adapters to HuggingFace Hub", description="Uploads LoRA adapters to HuggingFace Hub")
+        _parser.add_argument("--lora_adapters", dest="lora_adapters_path", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--repo_id", dest="repo_id", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--hf_token", dest="hf_token", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--private", dest="private", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--commit_message", dest="commit_message", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--repository_url", dest="repository_url_path", type=_make_parent_dirs_and_return_path, required=True, default=argparse.SUPPRESS)
+        _parsed_args = vars(_parser.parse_args())
+        upload_lora_adapters(**_parsed_args)
+
+    args:
+      - --lora_adapters
+      - {inputPath: lora_adapters}
+      - --repo_id
+      - {inputValue: repo_id}
+      - --hf_token
+      - {inputValue: hf_token}
+      - --private
+      - {inputValue: private}
+      - --commit_message
+      - {inputValue: commit_message}
+      - --repository_url
+      - {outputPath: repository_url}
