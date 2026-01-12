@@ -14,6 +14,8 @@ inputs:
   - {name: architecture_type, type: String, description: 'The architecture type', default: 'LoRA'}
   - {name: bearer_auth_token, type: string, description: 'Bearer token for authentication'}
   - {name: domain, type: String, description: 'The domain for the API endpoint'}
+  - {name: lora_adapter_repo_url, type: Data, description: 'Repository URL from Upload LoRA Adapters component (optional)', default: ''}
+  - {name: gguf_model_repo_url, type: Data, description: 'Repository URL from Upload GGUF Model component (optional)', default: ''}
 
 outputs:
   - {name: tracking_status, type: String, description: 'Status message from schema update'}
@@ -49,6 +51,8 @@ implementation:
         parser.add_argument('--architecture_type', type=str, default='LoRA')
         parser.add_argument('--bearer_auth_token', type=str, required=True)
         parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--lora_adapter_repo_url', type=str, default='')
+        parser.add_argument('--gguf_model_repo_url', type=str, default='')
         parser.add_argument('--tracking_status', type=str, required=True)
         args = parser.parse_args()
 
@@ -66,6 +70,50 @@ implementation:
             except Exception as e:
                 print("Warning - Could not read file - " + str(e))
                 return {}
+
+        def read_file_content(file_path):
+            #Read content from a file path#
+            if not file_path or file_path == '':
+                return ''
+            if not os.path.exists(file_path):
+                print("Warning: File not found - " + str(file_path))
+                return ''
+            try:
+                with open(file_path, 'r') as f:
+                    content = f.read().strip()
+                    return content if content else ''
+            except Exception as e:
+                print("Warning: Could not read file " + str(file_path) + " - " + str(e))
+                return ''
+
+        def extract_hf_id(repo_url, is_adapter=True):
+            #Extract HuggingFace ID from repository URL
+            #For adapters: Remove https://huggingface.co/ -> tharun2909/disligpt_FT_adapter
+            #For GGUF models: Replace https://huggingface.co/ with hf.co/ -> hf.co/tharun2909/disligpt_FT_new
+            if not repo_url or repo_url == '':
+                return ''
+            
+            repo_url = repo_url.strip()
+            
+            # Remove common URL prefixes
+            prefixes_to_remove = [
+                'https://huggingface.co/',
+                'http://huggingface.co/',
+                'huggingface.co/',
+            ]
+            
+            cleaned_url = repo_url
+            for prefix in prefixes_to_remove:
+                if cleaned_url.startswith(prefix):
+                    cleaned_url = cleaned_url[len(prefix):]
+                    break
+            
+            # For adapters: return the cleaned ID (username/model-name)
+            if is_adapter:
+                return cleaned_url
+            else:
+                # For GGUF models: prepend hf.co/
+                return 'hf.co/' + cleaned_url if cleaned_url else ''
 
         print("=" * 80)
         print("TRACKING LORA PIPELINE - SMART UPDATE")
@@ -111,7 +159,30 @@ implementation:
             print("Merged model not provided")
 
         print("")
-        print("Step 4 - Preparing tracking data")
+        print("Step 4 - Processing HuggingFace repository URLs")
+        
+        # Read and process LoRA adapter repository URL
+        lora_adapter_url = read_file_content(args.lora_adapter_repo_url)
+        adapterhf_id = extract_hf_id(lora_adapter_url, is_adapter=True)
+        
+        if adapterhf_id:
+            print("LoRA Adapter Repository URL: " + lora_adapter_url)
+            print("Extracted adapterhf_id: " + adapterhf_id)
+        else:
+            print("No LoRA adapter repository URL provided")
+        
+        # Read and process GGUF model repository URL
+        gguf_model_url = read_file_content(args.gguf_model_repo_url)
+        modelhf_id = extract_hf_id(gguf_model_url, is_adapter=False)
+        
+        if modelhf_id:
+            print("GGUF Model Repository URL: " + gguf_model_url)
+            print("Extracted modelhf_id: " + modelhf_id)
+        else:
+            print("No GGUF model repository URL provided")
+
+        print("")
+        print("Step 5 - Preparing tracking data")
         
         # Convert timestamp to long (milliseconds)
         execution_timestamp = int(datetime.utcnow().timestamp() * 1000)
@@ -125,11 +196,17 @@ implementation:
             "base_model_name": base_model,
             "adapter_location": args.lora_adapters_dir,
             "merged_model_location": merged_model_path,
-            "architecture_type": args.architecture_type
+            "architecture_type": args.architecture_type,
+            "adapterhf_id": adapterhf_id,
+            "modelhf_id": modelhf_id
         }
 
         print("Tracking " + str(len(tracking_data)) + " fields")
         print("Timestamp (long) = " + str(execution_timestamp))
+        if adapterhf_id:
+            print("adapterhf_id = " + adapterhf_id)
+        if modelhf_id:
+            print("modelhf_id = " + modelhf_id)
 
         # Read tokens
         with open(args.bearer_auth_token, 'r') as f:
@@ -148,7 +225,9 @@ implementation:
             "model_type": "architecture_type",
             "adapter_url": "adapter_location",
             "merged_model_url": "merged_model_location",
-            "model_url": "base_model_name"
+            "model_url": "base_model_name",
+            "adapterhf_id": "adapterhf_id",
+            "modelhf_id": "modelhf_id"
         }
 
         print("")
@@ -280,6 +359,10 @@ implementation:
                     if data_key in tracking_data:
                         value = tracking_data[data_key]
                         
+                        # Skip empty HF IDs
+                        if schema_column in ['adapterhf_id', 'modelhf_id'] and not value:
+                            continue
+                        
                         # Preserve data types
                         if isinstance(value, bool):
                             value_to_patch = value
@@ -348,6 +431,10 @@ implementation:
                     if data_key in tracking_data:
                         value = tracking_data[data_key]
                         
+                        # Skip empty HF IDs
+                        if schema_column in ['adapterhf_id', 'modelhf_id'] and not value:
+                            continue
+                        
                         if isinstance(value, bool):
                             value_to_patch = value
                         elif isinstance(value, (int, float)):
@@ -410,6 +497,10 @@ implementation:
                 for schema_column, data_key in mapping.items():
                     if data_key in tracking_data:
                         value = tracking_data[data_key]
+                        
+                        # Skip empty HF IDs
+                        if schema_column in ['adapterhf_id', 'modelhf_id'] and not value:
+                            continue
                         
                         if isinstance(value, bool):
                             value_to_add = value
@@ -503,5 +594,9 @@ implementation:
       - {inputPath: bearer_auth_token}
       - --domain
       - {inputValue: domain}
+      - --lora_adapter_repo_url
+      - {inputPath: lora_adapter_repo_url}
+      - --gguf_model_repo_url
+      - {inputPath: gguf_model_repo_url}
       - --tracking_status
       - {outputPath: tracking_status}
