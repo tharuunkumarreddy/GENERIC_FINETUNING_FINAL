@@ -14,8 +14,8 @@ inputs:
   - {name: architecture_type, type: String, description: 'The architecture type', default: 'LoRA'}
   - {name: bearer_auth_token, type: string, description: 'Bearer token for authentication'}
   - {name: domain, type: String, description: 'The domain for the API endpoint'}
-  - {name: lora_adapter_repo_url, type: Data, description: 'Repository URL from Upload LoRA Adapters component (optional)', default: ''}
-  - {name: gguf_model_repo_url, type: Data, description: 'Repository URL from Upload GGUF Model component (optional)', default: ''}
+  - {name: lora_adapter_repo_url, type: String, description: 'Repository URL from Upload LoRA Adapters component (optional)', default: ''}
+  - {name: gguf_model_repo_url, type: String, description: 'Repository URL from Upload GGUF Model component (optional)', default: ''}
 
 outputs:
   - {name: tracking_status, type: String, description: 'Status message from schema update'}
@@ -71,25 +71,36 @@ implementation:
                 print("Warning - Could not read file - " + str(e))
                 return {}
 
-        def read_file_content(file_path):
-            #Read content from a file path#
-            if not file_path or file_path == '':
+        def get_repo_url_value(url_input):
+            """Get repository URL from file path - Kubeflow saves String outputs as files"""
+            if not url_input or url_input == '':
                 return ''
-            if not os.path.exists(file_path):
-                print("Warning: File not found - " + str(file_path))
-                return ''
-            try:
-                with open(file_path, 'r') as f:
-                    content = f.read().strip()
-                    return content if content else ''
-            except Exception as e:
-                print("Warning: Could not read file " + str(file_path) + " - " + str(e))
-                return ''
+            
+            url_str = str(url_input).strip()
+            
+            # Try to read it as a file path (this is how Kubeflow passes String outputs)
+            if os.path.exists(url_str):
+                try:
+                    with open(url_str, 'r') as f:
+                        content = f.read().strip()
+                        return content if content else ''
+                except Exception as e:
+                    print("Warning: Could not read file " + str(url_str) + " - " + str(e))
+                    return ''
+            else:
+                # If file doesn't exist, might be passed as direct value (fallback)
+                if url_str.startswith('http://') or url_str.startswith('https://') or url_str.startswith('hf.co/'):
+                    return url_str
+                else:
+                    print("Warning: File not found - " + str(url_str))
+                    return ''
 
         def extract_hf_id(repo_url, is_adapter=True):
-            #Extract HuggingFace ID from repository URL
-            #For adapters: Remove https://huggingface.co/ -> tharun2909/disligpt_FT_adapter
-            #For GGUF models: Replace https://huggingface.co/ with hf.co/ -> hf.co/tharun2909/disligpt_FT_new
+            """
+            Extract HuggingFace ID from repository URL
+            For adapters: Remove https://huggingface.co/ -> tharun2909/disligpt_FT_adapter
+            For GGUF models: Replace https://huggingface.co/ with hf.co/ -> hf.co/tharun2909/disligpt_FT_new
+            """
             if not repo_url or repo_url == '':
                 return ''
             
@@ -162,7 +173,7 @@ implementation:
         print("Step 4 - Processing HuggingFace repository URLs")
         
         # Read and process LoRA adapter repository URL
-        lora_adapter_url = read_file_content(args.lora_adapter_repo_url)
+        lora_adapter_url = get_repo_url_value(args.lora_adapter_repo_url)
         adapterhf_id = extract_hf_id(lora_adapter_url, is_adapter=True)
         
         if adapterhf_id:
@@ -172,7 +183,7 @@ implementation:
             print("No LoRA adapter repository URL provided")
         
         # Read and process GGUF model repository URL
-        gguf_model_url = read_file_content(args.gguf_model_repo_url)
+        gguf_model_url = get_repo_url_value(args.gguf_model_repo_url)
         modelhf_id = extract_hf_id(gguf_model_url, is_adapter=False)
         
         if modelhf_id:
