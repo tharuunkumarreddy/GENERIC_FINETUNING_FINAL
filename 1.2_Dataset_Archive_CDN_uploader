@@ -1,0 +1,237 @@
+name: Dataset Archive CDN Uploader
+description: Compresses the entire dataset directory structure (train, validation, schema.json, etc.) from Generic Dataset Preparation and uploads the archive to CDN. Returns the public CDN URL and decompression instructions.
+
+inputs:
+  - name: dataset_directory
+    type: Data
+    description: 'Output directory from Generic Dataset Preparation component containing train/, validation/, schema.json, etc.'
+  - name: bearer_token
+    type: string
+    description: 'Bearer token for CDN authentication'
+  - name: compression_format
+    type: string
+    description: 'Compression format: tar.gz, zip, or tar'
+    default: 'tar.gz'
+
+outputs:
+  - name: archive_cdn_url
+    type: string
+    description: 'CDN URL where the compressed dataset archive is accessible'
+  - name: archive_metadata
+    type: Data
+    description: 'JSON file containing archive info, decompression instructions, and original structure metadata'
+
+implementation:
+  container:
+    image: python:3.9-slim
+    command:
+      - sh
+      - -c
+      - |
+        apt-get update && apt-get install -y curl
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import subprocess
+        import json
+        import os
+        import tarfile
+        import zipfile
+        import shutil
+        from datetime import datetime
+
+        parser = argparse.ArgumentParser(description='Compress dataset directory and upload to CDN.')
+        parser.add_argument('--dataset_directory', type=str, required=True)
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--compression_format', type=str, default='tar.gz', choices=['tar.gz', 'tar', 'zip'])
+        parser.add_argument('--archive_cdn_url', type=str, required=True)
+        parser.add_argument('--archive_metadata', type=str, required=True)
+        args = parser.parse_args()
+
+        bearer_token = args.bearer_token
+        upload_url = 'https://igs.gov-cloud.ai/mobius-content-service/v1.0/content/upload?filePath=MPQE1&contentTags=dataset'
+
+        def verify_dataset_structure(dataset_dir):
+            required_items = ['schema.json']
+            optional_items = ['train', 'validation']
+            
+            if not os.path.isdir(dataset_dir):
+                raise NotADirectoryError('Dataset directory not found: ' + dataset_dir)
+            
+            found_items = os.listdir(dataset_dir)
+            has_required = all(item in found_items for item in required_items)
+            has_splits = any(item in found_items for item in optional_items)
+            
+            if not has_required:
+                raise ValueError('Missing required files. Found: ' + str(found_items))
+            if not has_splits:
+                raise ValueError('No train or validation splits found. Found: ' + str(found_items))
+            
+            print('Dataset structure verified. Contents: ' + str(found_items))
+            return found_items
+
+        def get_directory_size(path):
+            total = 0
+            for dirpath, dirnames, filenames in os.walk(path):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.exists(filepath):
+                        total += os.path.getsize(filepath)
+            return total
+
+        def compress_directory(dataset_dir, output_archive, compression_format):
+            dataset_name = os.path.basename(dataset_dir.rstrip('/'))
+            print('Starting compression in ' + compression_format + ' format...')
+            
+            try:
+                if compression_format == 'tar.gz':
+                    with tarfile.open(output_archive, 'w:gz') as tar:
+                        tar.add(dataset_dir, arcname=dataset_name)
+                elif compression_format == 'tar':
+                    with tarfile.open(output_archive, 'w') as tar:
+                        tar.add(dataset_dir, arcname=dataset_name)
+                elif compression_format == 'zip':
+                    with zipfile.ZipFile(output_archive, 'w', zipfile.ZIP_DEFLATED) as zf:
+                        for root, dirs, files in os.walk(dataset_dir):
+                            for file in files:
+                                file_path = os.path.join(root, file)
+                                arcname = os.path.join(dataset_name, os.path.relpath(file_path, dataset_dir))
+                                zf.write(file_path, arcname)
+                
+                archive_size = os.path.getsize(output_archive)
+                size_mb = archive_size / 1024 / 1024
+                print('Compression successful! Archive size: ' + str(archive_size) + ' bytes (' + '{:.2f}'.format(size_mb) + ' MB)')
+                return archive_size
+            except Exception as e:
+                print('Compression failed: ' + str(e))
+                raise
+
+        def upload_file_to_cdn(file_path, output_url_path):
+            if not os.path.exists(file_path):
+                raise FileNotFoundError('File not found: ' + file_path)
+            
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                raise ValueError('Archive file is empty')
+            
+            size_mb = file_size / 1024 / 1024
+            print('Uploading archive: ' + file_path)
+            print('File size: ' + str(file_size) + ' bytes (' + '{:.2f}'.format(size_mb) + ' MB)')
+            
+            curl_command = [
+                'curl',
+                '--location', upload_url,
+                '--header', 'Authorization: Bearer ' + bearer_token,
+                '--form', 'file=@' + file_path,
+                '--fail',
+                '--show-error'
+            ]
+            
+            print('Executing upload...')
+            
+            try:
+                process = subprocess.run(curl_command, capture_output=True, check=True)
+                response_text = process.stdout.decode('utf-8')
+                print('Upload successful!')
+                
+                response_json = json.loads(response_text)
+                relative_cdn_url = response_json.get('cdnUrl')
+                
+                if not relative_cdn_url:
+                    raise ValueError('CDN response missing cdnUrl field')
+                
+                full_cdn_url = 'https://cdn-new.gov-cloud.ai' + relative_cdn_url
+                print('Archive available at: ' + full_cdn_url)
+                
+                output_dir = os.path.dirname(output_url_path)
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                
+                with open(output_url_path, 'w') as f:
+                    f.write(full_cdn_url)
+                
+                print('CDN URL saved to: ' + output_url_path)
+                return full_cdn_url
+            except subprocess.CalledProcessError as e:
+                print('Upload failed!')
+                print('Exit code: ' + str(e.returncode))
+                print('Error output: ' + e.stderr.decode('utf-8'))
+                raise
+            except json.JSONDecodeError as e:
+                print('Failed to parse server response as JSON')
+                print('Response was: ' + process.stdout.decode('utf-8'))
+                raise
+
+        def save_metadata(metadata_path, metadata_dict):
+            output_dir = os.path.dirname(metadata_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata_dict, f, indent=2)
+            
+            print('Metadata saved to: ' + metadata_path)
+
+        try:
+            print('Verifying dataset structure...')
+            contents = verify_dataset_structure(args.dataset_directory)
+            
+            original_size = get_directory_size(args.dataset_directory)
+            size_mb = original_size / 1024 / 1024
+            print('Original dataset size: ' + str(original_size) + ' bytes (' + '{:.2f}'.format(size_mb) + ' MB)')
+            
+            archive_name = 'dataset_archive.' + args.compression_format
+            archive_path = os.path.join('/tmp', archive_name)
+            
+            archive_size = compress_directory(args.dataset_directory, archive_path, args.compression_format)
+            cdn_url = upload_file_to_cdn(archive_path, args.archive_cdn_url)
+            
+            compression_ratio = (1 - archive_size / original_size) * 100 if original_size > 0 else 0
+            
+            decompression_cmds = {
+                'tar.gz': 'tar -xzf ' + archive_name,
+                'tar': 'tar -xf ' + archive_name,
+                'zip': 'unzip ' + archive_name
+            }
+            
+            metadata = {
+                'upload_timestamp': datetime.utcnow().isoformat(),
+                'cdn_url': cdn_url,
+                'original_size_bytes': original_size,
+                'archive_size_bytes': archive_size,
+                'compression_ratio_percent': round(compression_ratio, 2),
+                'compression_format': args.compression_format,
+                'directory_contents': contents,
+                'decompression_instructions': decompression_cmds[args.compression_format],
+                'reloading_note': 'After decompression, use load_from_disk() on the extracted directory to reload in Generic LoRA Fine-tuning component'
+            }
+            
+            save_metadata(args.archive_metadata, metadata)
+            
+            print('')
+            print('=' * 60)
+            print('SUCCESS!')
+            print('Archive available at: ' + cdn_url)
+            print('Compression ratio: ' + '{:.1f}'.format(compression_ratio) + '%')
+            print('Decompression command: ' + metadata['decompression_instructions'])
+            print('=' * 60)
+        except Exception as e:
+            print('')
+            print('UPLOAD FAILED!')
+            print('Error: ' + str(e))
+            raise
+
+    args:
+      - --dataset_directory
+      - {inputPath: dataset_directory}
+      - --bearer_token
+      - {inputValue: bearer_token}
+      - --compression_format
+      - {inputValue: compression_format}
+      - --archive_cdn_url
+      - {outputPath: archive_cdn_url}
+      - --archive_metadata
+      - {outputPath: archive_metadata}
