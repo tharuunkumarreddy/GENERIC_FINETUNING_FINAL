@@ -291,16 +291,16 @@ implementation:
 
         check_url = args.domain + "/pi-entity-instances-service/v3.0/schemas/" + args.schema_id + "/instances/list"
         
-        # Check 1: Does a record with this ID already exist?
+        # Check 1: Does a record with this model_id already exist?
         check_by_id_payload = {
             "dbType": "TIDB",
             "ownedOnly": True,
             "filter": {
-                "id": unique_id
+                "model_id": unique_id  # CHANGED: was "id"
             }
         }
         
-        print("Check 1: Looking for existing record with id = " + unique_id)
+        print("Check 1: Looking for existing record with model_id = " + unique_id)  # CHANGED: was "id"
         
         try:
             response = http.post(check_url, headers=headers, data=json.dumps(check_by_id_payload), timeout=60)
@@ -310,15 +310,15 @@ implementation:
             record_exists_by_id = bool(response_data.get("content"))
             
             if record_exists_by_id:
-                print("✓ Found existing record with id = " + unique_id)
+                print("✓ Found existing record with model_id = " + unique_id)  # CHANGED: was "id"
                 existing_record = response_data["content"][0]
                 print("Existing execution_id = " + str(existing_record.get("execution_id")))
                 print("Current execution_id = " + str(execution_id_value))
             else:
-                print("✗ No record found with id = " + unique_id)
+                print("✗ No record found with model_id = " + unique_id)  # CHANGED: was "id"
             
         except Exception as e:
-            print("Error checking by ID: " + str(e))
+            print("Error checking by model_id: " + str(e))  # CHANGED: was "ID"
             record_exists_by_id = False
 
         # Check 2: Does a record with this execution_id exist?
@@ -343,8 +343,8 @@ implementation:
             if record_exists_by_execution:
                 print("✓ Found existing record with execution_id = " + str(execution_id_value))
                 existing_exec_record = response_data["content"][0]
-                existing_id = existing_exec_record.get("id")
-                print("Existing id = " + str(existing_id))
+                existing_id = existing_exec_record.get("model_id")  # CHANGED: was .get("id")
+                print("Existing model_id = " + str(existing_id))  # CHANGED: was "id"
             else:
                 print("✗ No record found with execution_id = " + str(execution_id_value))
                 existing_id = None
@@ -361,9 +361,9 @@ implementation:
 
         try:
             if record_exists_by_id:
-                # Case 1: Record with this ID exists - UPDATE it
-                print("DECISION: UPDATE existing record (id = " + unique_id + ")")
-                print("Reason: Record with this ID already exists")
+                # Case 1: Record with this model_id exists - UPDATE it
+                print("DECISION: UPDATE existing record (model_id = " + unique_id + ")")  # CHANGED: was "id"
+                print("Reason: Record with this model_id already exists")  # CHANGED: was "ID"
                 
                 patch_requests = []
                 for schema_column, data_key in mapping.items():
@@ -403,7 +403,7 @@ implementation:
                     "conditionalFilter": {
                         "conditions": [
                             {
-                                "field": "id",
+                                "field": "model_id",  # CHANGED: was "id"
                                 "operator": "EQUAL",
                                 "value": unique_id
                             }
@@ -426,16 +426,16 @@ implementation:
                 
                 response.raise_for_status()
                 
-                status_message = "Updated record with id = " + unique_id + ", execution_id = " + str(execution_id_value)
+                status_message = "Updated record with model_id = " + unique_id + ", execution_id = " + str(execution_id_value)  # CHANGED: was "id"
                 print("✓ Successfully updated")
                 
             elif record_exists_by_execution:
-                # Case 2: Record with this execution_id exists but different ID
+                # Case 2: Record with this execution_id exists but different model_id
                 # This means user changed model_id but kept execution_id same
-                # UPDATE the existing record's ID
-                print("DECISION: UPDATE existing record (change ID)")
-                print("Reason: execution_id=" + str(execution_id_value) + " exists with different id=" + str(existing_id))
-                print("Action: Update existing record to use new id=" + unique_id)
+                # UPDATE the existing record's model_id
+                print("DECISION: UPDATE existing record (change model_id)")  # CHANGED: was "ID"
+                print("Reason: execution_id=" + str(execution_id_value) + " exists with different model_id=" + str(existing_id))  # CHANGED: was "id"
+                print("Action: Update existing record to use new model_id=" + unique_id)  # CHANGED: was "id"
                 
                 patch_requests = []
                 for schema_column, data_key in mapping.items():
@@ -459,13 +459,13 @@ implementation:
                             "value": value_to_patch
                         })
 
-                # Update the ID field too
+                # Update the model_id field too
                 patch_requests.append({
                     "operation": "REPLACE",
-                    "path": "id",
+                    "path": "model_id",  # CHANGED: was "id"
                     "value": unique_id
                 })
-                print("  UPDATE: id = " + unique_id)
+                print("  UPDATE: model_id = " + unique_id)  # CHANGED: was "id"
 
                 update_url = args.domain + "/pi-entity-instances-service/v2.0/schemas/" + args.schema_id + "/instances"
                 update_payload = {
@@ -496,7 +496,7 @@ implementation:
                 
                 response.raise_for_status()
                 
-                status_message = "Updated execution_id=" + str(execution_id_value) + " with new id=" + unique_id
+                status_message = "Updated execution_id=" + str(execution_id_value) + " with new model_id=" + unique_id  # CHANGED: was "id"
                 print("✓ Successfully updated")
                 
             else:
@@ -525,14 +525,14 @@ implementation:
                 
                 # Add required fields
                 creation_data['execution_id'] = execution_id_value
-                creation_data['id'] = unique_id
+                creation_data['model_id'] = unique_id  # CHANGED: was creation_data['id']
                 print("  CREATE: execution_id = " + str(execution_id_value))
-                print("  CREATE: id = " + unique_id)
+                print("  CREATE: model_id = " + unique_id)  # CHANGED: was "id"
                 
-                # Add projectId
+                # Add project_id
                 if args.projectId and args.projectId != '-1':
-                    creation_data['projectId'] = str(args.projectId)
-                    print("  CREATE: projectId = " + str(args.projectId))
+                    creation_data['project_id'] = str(args.projectId)  # CHANGED: was 'projectId'
+                    print("  CREATE: project_id = " + str(args.projectId))  # CHANGED: was "projectId"
 
                 create_url = args.domain + "/pi-entity-instances-service/v2.0/schemas/" + args.schema_id + "/instances"
                 create_payload = {
@@ -552,7 +552,7 @@ implementation:
                 
                 response.raise_for_status()
                 
-                status_message = "Created new record with id = " + unique_id + ", execution_id = " + str(execution_id_value)
+                status_message = "Created new record with model_id = " + unique_id + ", execution_id = " + str(execution_id_value)  # CHANGED: was "id"
                 print("✓ Successfully created")
             
             print("")
